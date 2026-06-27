@@ -101,6 +101,13 @@ OUTPUT_FEATURE_COLUMNS = [
     "restecg_2",
     "slope_2",
     "slope_3",
+    "missing_count",
+    "miss_thal",
+    "miss_cp",
+    "asymptomatic_male",
+    "oldpeak_slope",
+    "sex_oldpeak",
+    "cp_oldpeak",
 ]
 
 
@@ -214,9 +221,17 @@ def _engineer_features(raw):
     ca = raw[:, 11]
     exang = raw[:, 8]
     ex = np.nan_to_num(exang, nan=0.0)
+    sex = raw[:, 1]
+    missing_count = np.isnan(raw).sum(axis=1)
+    miss_thal = np.isnan(raw[:, 12])
+    miss_cp = np.isnan(raw[:, 2])
+    asymptomatic_male = (cp == 4) & (sex == 1)
+    oldpeak_slope = raw[:, 9] * raw[:, 10]
+    sex_oldpeak = sex * raw[:, 9]
+    cp_oldpeak = cp * raw[:, 9]
 
     n = raw.shape[0]
-    x = np.empty((n, 25), dtype=np.float64)
+    x = np.empty((n, 32), dtype=np.float64)
     x[:, 0] = age
     x[:, 1] = raw[:, 1]
     x[:, 2] = trestbps
@@ -242,6 +257,13 @@ def _engineer_features(raw):
     x[:, 22] = restecg == 2
     x[:, 23] = slope == 2
     x[:, 24] = slope == 3
+    x[:, 25] = missing_count
+    x[:, 26] = miss_thal
+    x[:, 27] = miss_cp
+    x[:, 28] = asymptomatic_male
+    x[:, 29] = oldpeak_slope
+    x[:, 30] = sex_oldpeak
+    x[:, 31] = cp_oldpeak
     return x
 
 
@@ -333,6 +355,16 @@ def _predict_fused(raw, model):
     z += w[22] * (restecg == 2)
     z += w[23] * (slope == 2)
     z += w[24] * (slope == 3)
+    z += w[25] * np.isnan(raw).sum(axis=1)
+    z += w[26] * np.isnan(raw[:, 12])
+    z += w[27] * np.isnan(raw[:, 2])
+    z += w[28] * ((cp == 4) & (raw[:, 1] == 1))
+    oldpeak_slope = raw[:, 9] * raw[:, 10]
+    z += w[29] * np.where(np.isnan(oldpeak_slope), impute[29], oldpeak_slope)
+    sex_oldpeak = raw[:, 1] * raw[:, 9]
+    z += w[30] * np.where(np.isnan(sex_oldpeak), impute[30], sex_oldpeak)
+    cp_oldpeak = raw[:, 2] * raw[:, 9]
+    z += w[31] * np.where(np.isnan(cp_oldpeak), impute[31], cp_oldpeak)
     return 1.0 / (1.0 + np.exp(-z))
 
 
