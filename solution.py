@@ -193,16 +193,16 @@ def _add_one_hot_and_risk(work):
     return work.drop(columns=["cp", "restecg", "slope"])
 
 
-def _extract_raw(df):
+def _extract_raw(df, dtype=np.float64):
     if SOURCE_COLUMNS[0] in df.columns:
-        return df[SOURCE_COLUMNS].to_numpy(dtype=np.float64, na_value=np.nan)
+        return df[SOURCE_COLUMNS].to_numpy(dtype=dtype, na_value=np.nan)
 
     work = df.drop(columns=["Heart Disease", "id"], errors="ignore")
     rename_cols = {src: dst for src, dst in COLUMN_MAP.items() if src in work.columns}
     if rename_cols:
         work = work.rename(columns=rename_cols)
     work = work.replace("?", np.nan)
-    return work[FEATURE_COLUMNS].to_numpy(dtype=np.float64, na_value=np.nan)
+    return work[FEATURE_COLUMNS].to_numpy(dtype=dtype, na_value=np.nan)
 
 
 def _engineer_features(raw):
@@ -269,7 +269,7 @@ def _engineer_features(raw):
 
 def preprocess(df):
     ids = df["id"].to_numpy()
-    raw = _extract_raw(df).astype(np.float32, copy=False)
+    raw = _extract_raw(df, dtype=np.float32)
     out = pd.DataFrame({"id": ids})
     out.attrs["raw"] = raw
     return out
@@ -309,44 +309,43 @@ def _predict_fused(raw, model):
     w = model["w"]
     bias = model["bias"]
 
+    missing = np.isnan(raw)
     age = raw[:, 0]
+    sex = raw[:, 1]
     cp = raw[:, 2]
     trestbps = np.clip(raw[:, 3], *OUTLIER_BOUNDS["trestbps"])
     chol = np.clip(raw[:, 4], *OUTLIER_BOUNDS["chol"])
-    thalach = np.clip(raw[:, 7], *OUTLIER_BOUNDS["thalach"])
-    oldpeak = np.clip(raw[:, 9], *OUTLIER_BOUNDS["oldpeak"])
-    thal = raw[:, 12]
-    thal = np.where(thal == 3, 0, np.where(thal == 6, 1, np.where(thal == 7, 2, thal)))
+    fbs = raw[:, 5]
     restecg = raw[:, 6]
+    thalach = np.clip(raw[:, 7], *OUTLIER_BOUNDS["thalach"])
+    exang = raw[:, 8]
+    oldpeak_raw = raw[:, 9]
+    oldpeak = np.clip(raw[:, 9], *OUTLIER_BOUNDS["oldpeak"])
     slope = raw[:, 10]
     ca = raw[:, 11]
-    exang = raw[:, 8]
-    ex = np.nan_to_num(exang, nan=0.0)
-
-    hr = np.where(
-        np.isnan(thalach / np.maximum(220 - age, 1)),
-        impute[16],
-        thalach / np.maximum(220 - age, 1),
-    )
+    thal = raw[:, 12]
+    thal = np.where(thal == 3, 0, np.where(thal == 6, 1, np.where(thal == 7, 2, thal)))
+    hr = thalach / np.maximum(220 - age, 1)
+    ex = np.where(missing[:, 8], 0.0, exang)
 
     z = np.full(raw.shape[0], bias, dtype=np.float32)
-    z += w[0] * np.where(np.isnan(age), impute[0], age)
-    z += w[1] * np.where(np.isnan(raw[:, 1]), impute[1], raw[:, 1])
-    z += w[2] * np.where(np.isnan(trestbps), impute[2], trestbps)
-    z += w[3] * np.where(np.isnan(chol), impute[3], chol)
-    z += w[4] * np.where(np.isnan(raw[:, 5]), impute[4], raw[:, 5])
-    z += w[5] * np.where(np.isnan(thalach), impute[5], thalach)
-    z += w[6] * np.where(np.isnan(exang), impute[6], exang)
-    z += w[7] * np.where(np.isnan(oldpeak), impute[7], oldpeak)
-    z += w[8] * np.where(np.isnan(ca), impute[8], ca)
-    z += w[9] * np.where(np.isnan(thal), impute[9], thal)
+    z += w[0] * np.where(missing[:, 0], impute[0], age)
+    z += w[1] * np.where(missing[:, 1], impute[1], sex)
+    z += w[2] * np.where(missing[:, 3], impute[2], trestbps)
+    z += w[3] * np.where(missing[:, 4], impute[3], chol)
+    z += w[4] * np.where(missing[:, 5], impute[4], fbs)
+    z += w[5] * np.where(missing[:, 7], impute[5], thalach)
+    z += w[6] * np.where(missing[:, 8], impute[6], exang)
+    z += w[7] * np.where(missing[:, 9], impute[7], oldpeak)
+    z += w[8] * np.where(missing[:, 11], impute[8], ca)
+    z += w[9] * np.where(missing[:, 12], impute[9], thal)
     z += w[10] * ((age >= 40) & (age < 55))
     z += w[11] * ((age >= 55) & (age < 70))
     z += w[12] * (age >= 70)
     z += w[13] * (chol > 240)
     z += w[14] * (trestbps > 140)
     z += w[15] * (oldpeak > 2)
-    z += w[16] * hr
+    z += w[16] * np.where(np.isnan(hr), impute[16], hr)
     z += w[17] * (ex + (oldpeak > 1) + (cp == 4) + (ca >= 1) + (thal == 2))
     z += w[18] * (cp == 2)
     z += w[19] * (cp == 3)
@@ -355,17 +354,21 @@ def _predict_fused(raw, model):
     z += w[22] * (restecg == 2)
     z += w[23] * (slope == 2)
     z += w[24] * (slope == 3)
-    z += w[25] * np.isnan(raw).sum(axis=1)
-    z += w[26] * np.isnan(raw[:, 12])
-    z += w[27] * np.isnan(raw[:, 2])
-    z += w[28] * ((cp == 4) & (raw[:, 1] == 1))
-    oldpeak_slope = raw[:, 9] * raw[:, 10]
+    z += w[25] * missing.sum(axis=1)
+    z += w[26] * missing[:, 12]
+    z += w[27] * missing[:, 2]
+    z += w[28] * ((cp == 4) & (sex == 1))
+    oldpeak_slope = oldpeak_raw * slope
     z += w[29] * np.where(np.isnan(oldpeak_slope), impute[29], oldpeak_slope)
-    sex_oldpeak = raw[:, 1] * raw[:, 9]
+    sex_oldpeak = sex * oldpeak_raw
     z += w[30] * np.where(np.isnan(sex_oldpeak), impute[30], sex_oldpeak)
-    cp_oldpeak = raw[:, 2] * raw[:, 9]
+    cp_oldpeak = cp * oldpeak_raw
     z += w[31] * np.where(np.isnan(cp_oldpeak), impute[31], cp_oldpeak)
-    return 1.0 / (1.0 + np.exp(-z))
+    np.negative(z, out=z)
+    np.exp(z, out=z)
+    z += 1.0
+    np.reciprocal(z, out=z)
+    return z
 
 
 def _predict_numpy(df, model):
@@ -399,16 +402,16 @@ def predict(df, model):
 
 
 def run(df) -> tuple[float, float, float]:
-    from time import time
+    from time import perf_counter
 
-    start = time.perf_counter()
+    start = perf_counter()
 
     df_processed = preprocess(df)
     model = load_model()
     size = get_model_size(model)
     predictions = predict(df_processed, model)
 
-    duration = time.perf_counter() - start
+    duration = perf_counter() - start
     accuracy = get_model_accuracy(predictions)
 
     return size, accuracy, duration
