@@ -1,11 +1,10 @@
-"""Train model.pkl from train.csv using the CardioScan notebook pipeline."""
+"""Train model.bin from train.csv using the CardioScan notebook pipeline."""
 
 import re
 import warnings
 from pathlib import Path
 from time import perf_counter
 
-import joblib
 import numpy as np
 import pandas as pd
 from scipy.stats import uniform
@@ -21,16 +20,17 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 import solution
 
 TRAIN_PATH = Path(__file__).resolve().parent / "train.csv"
-MODEL_PATH = Path(__file__).resolve().parent / "model.pkl"
+MODEL_PATH = Path(__file__).resolve().parent / "model.bin"
 SOLUTION_PATH = Path(__file__).resolve().parent / "solution.py"
 OUTLIER_COLUMNS = ["trestbps", "chol", "thalach", "oldpeak"]
 TUNING_SAMPLE_SIZE = 80_000
 RANDOM_STATE = 42
 SKIP_TUNING = True
 CACHED_MODEL_PARAMS = {
-    "C": 15.112022770860973,
+    "C": 0.11144234247204798,
     "class_weight": "balanced",
-    "penalty": "l2",
+    "l1_ratio": 0.8246883570320924,
+    "penalty": "elasticnet",
     "solver": "saga",
 }
 
@@ -67,18 +67,41 @@ def deduplicate_training_rows(df):
     )
     feature_cols = [col for col in solution.FEATURE_COLUMNS if col in mapped.columns]
     before = len(df)
-    keep_idx = mapped.drop_duplicates(subset=feature_cols).index
+    labels = (df["Heart Disease"] == "Presence").astype(int)
+
+    work = mapped[feature_cols].copy()
+    work["_label"] = labels.values
+    work["_idx"] = df.index.to_numpy()
+
+    keep_idx = []
+    tie_conflicts = 0
+    for _, group in work.groupby(list(feature_cols), dropna=False):
+        if group["_label"].nunique() == 1:
+            keep_idx.append(group["_idx"].iloc[0])
+            continue
+        modes = group["_label"].mode()
+        if len(modes) == 1:
+            majority = modes.iloc[0]
+            keep_idx.append(group[group["_label"] == majority]["_idx"].iloc[0])
+        else:
+            tie_conflicts += 1
+
     deduped = df.loc[keep_idx].reset_index(drop=True)
     removed = before - len(deduped)
     if removed:
-        print(f"Removed {removed:,} duplicate feature rows")
+        print(
+            f"Removed {removed:,} duplicate/conflicting rows "
+            f"({tie_conflicts:,} tie-conflict groups dropped)"
+        )
     return deduped
 
 
 def prepare_training_frame(df):
     y = (df["Heart Disease"] == "Presence").astype(int)
-    processed = solution.preprocess(df)
-    x = processed.drop(columns=["id"])
+    raw = solution._extract_raw(df)
+    x = pd.DataFrame(
+        solution._engineer_features(raw), columns=solution.OUTPUT_FEATURE_COLUMNS
+    )
     return x, y
 
 
@@ -125,13 +148,22 @@ def export_inference_bundle(pipeline, feature_columns, bounds):
     preprocessor = pipeline.named_steps["preprocessor"]
     lr = pipeline.named_steps["model"]
     num_pipe = preprocessor.named_transformers_["num"]
+    scale = num_pipe.named_steps["scaler"].scale_
+    mean = num_pipe.named_steps["scaler"].mean_
+    coef = lr.coef_.ravel()
+    intercept = float(lr.intercept_[0])
+    w = coef / scale
+    impute = num_pipe.named_steps["imputer"].statistics_
     return {
         "feature_columns": feature_columns,
-        "impute_values": num_pipe.named_steps["imputer"].statistics_,
-        "scale_mean": num_pipe.named_steps["scaler"].mean_,
-        "scale_scale": num_pipe.named_steps["scaler"].scale_,
-        "coef": lr.coef_.ravel(),
-        "intercept": float(lr.intercept_[0]),
+        "impute_values": impute,
+        "impute_f32": impute.astype(np.float32),
+        "scale_mean": mean,
+        "scale_scale": scale,
+        "coef": coef,
+        "intercept": intercept,
+        "w": w.astype(np.float32),
+        "bias": np.float32(intercept - mean @ w),
         "outlier_bounds": bounds,
     }
 
@@ -158,12 +190,21 @@ def tune_hyperparameters(x_train, y_train):
         ]
     )
 
-    param_dist = {
-        "model__C": uniform(0.001, 20),
-        "model__solver": ["lbfgs", "liblinear", "saga"],
-        "model__class_weight": [None, "balanced"],
-        "model__penalty": ["l2", "l1"],
-    }
+    param_dist = [
+        {
+            "model__C": uniform(0.001, 20),
+            "model__solver": ["saga"],
+            "model__class_weight": ["balanced"],
+            "model__penalty": ["l1", "l2"],
+        },
+        {
+            "model__C": uniform(0.001, 20),
+            "model__solver": ["saga"],
+            "model__class_weight": ["balanced"],
+            "model__penalty": ["elasticnet"],
+            "model__l1_ratio": uniform(0.05, 0.95),
+        },
+    ]
 
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     x_tune, y_tune = stratified_subsample(x_train, y_train, TUNING_SAMPLE_SIZE)
@@ -201,14 +242,13 @@ def extract_model_params(best_params):
     }
 
 
-def verify_prediction_parity(pipeline, bundle, x_val, ids):
+def verify_prediction_parity(pipeline, bundle, x_val, val_raw_df):
     sklearn_preds = pipeline.predict_proba(x_val)[:, 1]
-    val_df = x_val.copy()
-    val_df["id"] = ids
-    fast_preds = solution.predict(val_df, bundle)["Heart Disease"].to_numpy()
+    processed = solution.preprocess(val_raw_df)
+    fast_preds = solution.predict(processed, bundle)["Heart Disease"].to_numpy()
     max_diff = float(np.max(np.abs(sklearn_preds - fast_preds)))
     print(f"Prediction parity max abs diff: {max_diff:.2e}")
-    if max_diff >= 1e-10:
+    if max_diff >= 1e-6:
         raise RuntimeError(f"Fast predict diverges from sklearn pipeline: {max_diff}")
     return max_diff
 
@@ -251,15 +291,19 @@ def main():
     x, y = prepare_training_frame(df)
     print(f"Training samples: {len(x):,} | features: {x.shape[1]}")
 
-    x_train, x_val, y_train, y_val = train_test_split(
-        x, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+    y_all = (df["Heart Disease"] == "Presence").astype(int)
+    df_train, df_val, y_train, y_val = train_test_split(
+        df, y_all, test_size=0.2, random_state=RANDOM_STATE, stratify=y_all
     )
-    val_ids = np.arange(len(x_val))
+    x_val, _ = prepare_training_frame(df_val)
 
     if SKIP_TUNING:
         print("Using cached tuned hyperparameters (skipping RandomizedSearchCV)...")
         model_params = CACHED_MODEL_PARAMS
     else:
+        x_train, _, y_train, _ = train_test_split(
+            x, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+        )
         best_params = tune_hyperparameters(x_train, y_train)
         model_params = extract_model_params(best_params)
 
@@ -272,9 +316,10 @@ def main():
     print(f"Holdout ROC-AUC: {val_auc:.4f}")
 
     bundle = export_inference_bundle(pipeline, x.columns.tolist(), bounds)
-    verify_prediction_parity(pipeline, bundle, x_val, val_ids)
+    verify_prediction_parity(pipeline, bundle, x_val, df_val)
 
-    joblib.dump(bundle, MODEL_PATH)
+    with open(MODEL_PATH, "wb") as f:
+        np.save(f, bundle, allow_pickle=True)
     print(f"Saved lightweight bundle: {MODEL_PATH}")
 
     print(f"Benchmarking full dataset ({len(df):,} rows)...")

@@ -8,7 +8,6 @@
 # Good luck!
 # ----------------------------------------------------------------
 
-import joblib
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -40,7 +39,7 @@ OUTLIER_BOUNDS = {
     "oldpeak": (-4.2, 5.6),
 }
 
-MODEL_PATH = Path(__file__).resolve().parent / "model.pkl"
+MODEL_PATH = Path(__file__).resolve().parent / "model.bin"
 _CACHED_MODEL = None
 
 
@@ -58,6 +57,50 @@ FEATURE_COLUMNS = [
     "slope",
     "ca",
     "thal",
+]
+
+SOURCE_COLUMNS = [
+    "Age",
+    "Sex",
+    "Chest pain type",
+    "BP",
+    "Cholesterol",
+    "FBS over 120",
+    "EKG results",
+    "Max HR",
+    "Exercise angina",
+    "ST depression",
+    "Slope of ST",
+    "Number of vessels fluro",
+    "Thallium",
+]
+
+OUTPUT_FEATURE_COLUMNS = [
+    "age",
+    "sex",
+    "trestbps",
+    "chol",
+    "fbs",
+    "thalach",
+    "exang",
+    "oldpeak",
+    "ca",
+    "thal",
+    "age_group_middle",
+    "age_group_senior",
+    "age_group_elderly",
+    "high_chol",
+    "high_bp",
+    "sig_oldpeak",
+    "hr_ratio",
+    "risk_score",
+    "cp_2",
+    "cp_3",
+    "cp_4",
+    "restecg_1",
+    "restecg_2",
+    "slope_2",
+    "slope_3",
 ]
 
 
@@ -104,40 +147,119 @@ def engineer_features(df):
     out["sig_oldpeak"] = (out["oldpeak"] > 2.0).astype(int)
     out["hr_ratio"] = out["thalach"] / (220 - out["age"]).clip(lower=1)
 
+    out["risk_score"] = (
+        out["exang"].fillna(0).astype(float)
+        + (out["oldpeak"] > 1.0).fillna(False).astype(float)
+        + (out["cp"] == 4).fillna(False).astype(float)
+        + (out["ca"] >= 1).fillna(False).astype(float)
+        + (out["thal"] == 2).fillna(False).astype(float)
+    )
+
+    out["cp_2"] = (out["cp"] == 2).astype(int)
+    out["cp_3"] = (out["cp"] == 3).astype(int)
+    out["cp_4"] = (out["cp"] == 4).astype(int)
+    out["restecg_1"] = (out["restecg"] == 1).astype(int)
+    out["restecg_2"] = (out["restecg"] == 2).astype(int)
+    out["slope_2"] = (out["slope"] == 2).astype(int)
+    out["slope_3"] = (out["slope"] == 3).astype(int)
+    out = out.drop(columns=["cp", "restecg", "slope"])
+
     return out
 
 
-def preprocess(df):
-    ids = df["id"]
-    work = df.drop(columns=["Heart Disease", "id"], errors="ignore")
+def _add_one_hot_and_risk(work):
+    work["risk_score"] = (
+        work["exang"].fillna(0).astype(float)
+        + (work["oldpeak"] > 1.0).fillna(False).astype(float)
+        + (work["cp"] == 4).fillna(False).astype(float)
+        + (work["ca"] >= 1).fillna(False).astype(float)
+        + (work["thal"] == 2).fillna(False).astype(float)
+    )
 
+    work["cp_2"] = (work["cp"] == 2).astype(np.int8)
+    work["cp_3"] = (work["cp"] == 3).astype(np.int8)
+    work["cp_4"] = (work["cp"] == 4).astype(np.int8)
+    work["restecg_1"] = (work["restecg"] == 1).astype(np.int8)
+    work["restecg_2"] = (work["restecg"] == 2).astype(np.int8)
+    work["slope_2"] = (work["slope"] == 2).astype(np.int8)
+    work["slope_3"] = (work["slope"] == 3).astype(np.int8)
+    return work.drop(columns=["cp", "restecg", "slope"])
+
+
+def _extract_raw(df):
+    if SOURCE_COLUMNS[0] in df.columns:
+        return df[SOURCE_COLUMNS].to_numpy(dtype=np.float64, na_value=np.nan)
+
+    work = df.drop(columns=["Heart Disease", "id"], errors="ignore")
     rename_cols = {src: dst for src, dst in COLUMN_MAP.items() if src in work.columns}
     if rename_cols:
         work = work.rename(columns=rename_cols)
-
     work = work.replace("?", np.nan)
+    return work[FEATURE_COLUMNS].to_numpy(dtype=np.float64, na_value=np.nan)
 
-    for col in FEATURE_COLUMNS:
-        if col in work.columns:
-            work[col] = pd.to_numeric(work[col], errors="coerce")
 
-    if "thal" in work.columns:
-        work["thal"] = work["thal"].map(THALLIUM_MAP)
+def _engineer_features(raw):
+    age = raw[:, 0]
+    cp = raw[:, 2]
+    trestbps = np.clip(raw[:, 3], *OUTLIER_BOUNDS["trestbps"])
+    chol = np.clip(raw[:, 4], *OUTLIER_BOUNDS["chol"])
+    thalach = np.clip(raw[:, 7], *OUTLIER_BOUNDS["thalach"])
+    oldpeak = np.clip(raw[:, 9], *OUTLIER_BOUNDS["oldpeak"])
+    thal = raw[:, 12].copy()
+    thal[thal == 3] = 0
+    thal[thal == 6] = 1
+    thal[thal == 7] = 2
+    restecg = raw[:, 6]
+    slope = raw[:, 10]
+    ca = raw[:, 11]
+    exang = raw[:, 8]
+    ex = np.nan_to_num(exang, nan=0.0)
 
-    for col, (lower, upper) in OUTLIER_BOUNDS.items():
-        if col in work.columns:
-            work[col] = work[col].clip(lower=lower, upper=upper)
+    n = raw.shape[0]
+    x = np.empty((n, 25), dtype=np.float64)
+    x[:, 0] = age
+    x[:, 1] = raw[:, 1]
+    x[:, 2] = trestbps
+    x[:, 3] = chol
+    x[:, 4] = raw[:, 5]
+    x[:, 5] = thalach
+    x[:, 6] = exang
+    x[:, 7] = oldpeak
+    x[:, 8] = ca
+    x[:, 9] = thal
+    x[:, 10] = (age >= 40) & (age < 55)
+    x[:, 11] = (age >= 55) & (age < 70)
+    x[:, 12] = age >= 70
+    x[:, 13] = chol > 240
+    x[:, 14] = trestbps > 140
+    x[:, 15] = oldpeak > 2
+    x[:, 16] = thalach / np.maximum(220 - age, 1)
+    x[:, 17] = ex + (oldpeak > 1) + (cp == 4) + (ca >= 1) + (thal == 2)
+    x[:, 18] = cp == 2
+    x[:, 19] = cp == 3
+    x[:, 20] = cp == 4
+    x[:, 21] = restecg == 1
+    x[:, 22] = restecg == 2
+    x[:, 23] = slope == 2
+    x[:, 24] = slope == 3
+    return x
 
-    work["age_group_middle"] = ((work["age"] >= 40) & (work["age"] < 55)).astype(np.int8)
-    work["age_group_senior"] = ((work["age"] >= 55) & (work["age"] < 70)).astype(np.int8)
-    work["age_group_elderly"] = (work["age"] >= 70).astype(np.int8)
-    work["high_chol"] = (work["chol"] > 240).astype(np.int8)
-    work["high_bp"] = (work["trestbps"] > 140).astype(np.int8)
-    work["sig_oldpeak"] = (work["oldpeak"] > 2.0).astype(np.int8)
-    work["hr_ratio"] = work["thalach"] / (220 - work["age"]).clip(lower=1)
 
-    work["id"] = ids.to_numpy()
-    return work
+def preprocess(df):
+    ids = df["id"].to_numpy()
+    raw = _extract_raw(df).astype(np.float32, copy=False)
+    out = pd.DataFrame({"id": ids})
+    out.attrs["raw"] = raw
+    return out
+
+
+def _ensure_fused_weights(model):
+    if "w" in model:
+        return
+    w = model["coef"] / model["scale_scale"]
+    model["w"] = w.astype(np.float32)
+    model["bias"] = np.float32(model["intercept"] - model["scale_mean"] @ w)
+    model["impute_f32"] = model["impute_values"].astype(np.float32)
 
 
 def load_model():
@@ -145,36 +267,92 @@ def load_model():
     if _CACHED_MODEL is not None:
         return _CACHED_MODEL
 
-    bundle = joblib.load(MODEL_PATH)
+    with open(MODEL_PATH, "rb") as f:
+        bundle = np.load(f, allow_pickle=True).item()
     if isinstance(bundle, dict):
         if "outlier_bounds" in bundle:
             OUTLIER_BOUNDS = bundle["outlier_bounds"]
         if "pipeline" in bundle:
             _CACHED_MODEL = bundle["pipeline"]
         else:
+            _ensure_fused_weights(bundle)
             _CACHED_MODEL = bundle
     else:
         _CACHED_MODEL = bundle
     return _CACHED_MODEL
 
 
+def _predict_fused(raw, model):
+    impute = model["impute_f32"]
+    w = model["w"]
+    bias = model["bias"]
+
+    age = raw[:, 0]
+    cp = raw[:, 2]
+    trestbps = np.clip(raw[:, 3], *OUTLIER_BOUNDS["trestbps"])
+    chol = np.clip(raw[:, 4], *OUTLIER_BOUNDS["chol"])
+    thalach = np.clip(raw[:, 7], *OUTLIER_BOUNDS["thalach"])
+    oldpeak = np.clip(raw[:, 9], *OUTLIER_BOUNDS["oldpeak"])
+    thal = raw[:, 12]
+    thal = np.where(thal == 3, 0, np.where(thal == 6, 1, np.where(thal == 7, 2, thal)))
+    restecg = raw[:, 6]
+    slope = raw[:, 10]
+    ca = raw[:, 11]
+    exang = raw[:, 8]
+    ex = np.nan_to_num(exang, nan=0.0)
+
+    hr = np.where(
+        np.isnan(thalach / np.maximum(220 - age, 1)),
+        impute[16],
+        thalach / np.maximum(220 - age, 1),
+    )
+
+    z = np.full(raw.shape[0], bias, dtype=np.float32)
+    z += w[0] * np.where(np.isnan(age), impute[0], age)
+    z += w[1] * np.where(np.isnan(raw[:, 1]), impute[1], raw[:, 1])
+    z += w[2] * np.where(np.isnan(trestbps), impute[2], trestbps)
+    z += w[3] * np.where(np.isnan(chol), impute[3], chol)
+    z += w[4] * np.where(np.isnan(raw[:, 5]), impute[4], raw[:, 5])
+    z += w[5] * np.where(np.isnan(thalach), impute[5], thalach)
+    z += w[6] * np.where(np.isnan(exang), impute[6], exang)
+    z += w[7] * np.where(np.isnan(oldpeak), impute[7], oldpeak)
+    z += w[8] * np.where(np.isnan(ca), impute[8], ca)
+    z += w[9] * np.where(np.isnan(thal), impute[9], thal)
+    z += w[10] * ((age >= 40) & (age < 55))
+    z += w[11] * ((age >= 55) & (age < 70))
+    z += w[12] * (age >= 70)
+    z += w[13] * (chol > 240)
+    z += w[14] * (trestbps > 140)
+    z += w[15] * (oldpeak > 2)
+    z += w[16] * hr
+    z += w[17] * (ex + (oldpeak > 1) + (cp == 4) + (ca >= 1) + (thal == 2))
+    z += w[18] * (cp == 2)
+    z += w[19] * (cp == 3)
+    z += w[20] * (cp == 4)
+    z += w[21] * (restecg == 1)
+    z += w[22] * (restecg == 2)
+    z += w[23] * (slope == 2)
+    z += w[24] * (slope == 3)
+    return 1.0 / (1.0 + np.exp(-z))
+
+
 def _predict_numpy(df, model):
     cols = model["feature_columns"]
-    impute = model["impute_values"]
+    _ensure_fused_weights(model)
     x = df[cols].to_numpy(dtype=np.float64, copy=True)
-    for j in range(x.shape[1]):
-        mask = np.isnan(x[:, j])
-        if mask.any():
-            x[mask, j] = impute[j]
-    x -= model["scale_mean"]
-    x /= model["scale_scale"]
-    logits = x @ model["coef"] + model["intercept"]
+    x = np.where(np.isnan(x), model["impute_values"], x)
+    logits = x @ model["w"].astype(np.float64) + float(model["bias"])
     return 1.0 / (1.0 + np.exp(-logits))
 
 
 def predict(df, model):
     if isinstance(model, dict) and "coef" in model:
-        preds = _predict_numpy(df, model)
+        raw = df.attrs.get("raw")
+        if raw is not None:
+            _ensure_fused_weights(model)
+            preds = _predict_fused(raw, model)
+        else:
+            preds = _predict_numpy(df, model)
     else:
         feature_cols = [col for col in df.columns if col != "id"]
         preds = model.predict_proba(df[feature_cols])[:, 1]
